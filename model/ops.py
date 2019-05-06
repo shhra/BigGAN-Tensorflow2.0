@@ -224,6 +224,67 @@ class Linear(keras.layers.Layer):
 def hw_flatten(x):
     return tf.reshape(x, shape=[x.get_shape()[0], -1, x.get_shape()[-1]])
 
+
+# +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+# Conditional Batch Normalization
+# +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+class ClassConditionalBatchNorm(tf.keras.layers.Layer):
+
+    def __init__(self, z, **kwargs):
+        super(ClassConditionalBatchNorm, self).__init__(**kwargs, dynamic=True)
+        self.test_mean = None
+        self.test_var = None
+        self.ema_mean = None
+        self.ema_var = None
+        self.z = z
+
+    def build(self, input_shape):
+        c = input_shape[-1]
+        zeros = tf.keras.initializers.Constant(0.0)
+        self.test_mean = self.add_variable(
+            initializer=zeros,
+            shape=[c],
+            name='allocated_mean',
+            dtype=tf.float32,
+            trainable=False)
+
+        one = tf.keras.initializers.Constant(1.0)
+        self.test_var = self.add_variable(
+            initializer=one,
+            shape=[c],
+            name='allocated_var',
+            dtype=tf.float32,
+            trainable=False)
+
+        super(ClassConditionalBatchNorm, self).build(input_shape)
+
+    def call(self, x, is_training=True):
+        _, _, _, c = x.get_shape().as_list()
+        decay = 0.9
+        eps = 1e-05
+
+        split = tf.keras.layers.Flatten()(self.z)
+        beta = Linear(units=c)(split)
+        gamma = Linear(units=c)(split)
+
+        beta = tf.reshape(beta, shape=[-1, 1, 1, c])
+        gamma = tf.reshape(gamma, shape=[-1, 1, 1, c])
+
+        if is_training:
+            batch_mean, batch_var = tf.nn.moments(x, [0, 1, 2])
+            self.ema_mean = self.test_mean * decay + batch_mean * (1 - decay)
+            self.ema_var = self.test_var * decay + batch_mean * (1 - decay)
+
+            with tf.control_dependencies([self.ema_mean, self.ema_var]):
+                return tf.nn.batch_normalization(x, batch_mean, batch_var, beta, gamma, eps)
+        else:
+            return tf.nn.batch_normalization(x, self.test_mean, self.test_var, beta, gamma, eps)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+
+
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 # Model blocks
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -233,10 +294,12 @@ class ResBlock(keras.Model):
     """
     Create a ResNet block for up sampling
     """
-    def __init__(self, inputs, channel):
+    def __init__(self, channel):
         super(ResBlock, self).__init__(name='')
-        pass
+        self.channel = channel
 
+    def call(self, input, is_training, sn):
+        pass
 
 class ResBlockUp(keras.Model):
     """
@@ -257,14 +320,17 @@ class ResBlockDown(keras.Model):
 
 
 class DummyModel(keras.Model):
-    def __init__(self):
-        super(DummyModel, self).__init__()
+    def __init__(self, z, **kwargs):
+        super(DummyModel, self).__init__(**kwargs)
+        self.z = z
         self.l1 = Conv(filters=16, kernel=3, stride=1, pad=0, sn=False)
         self.l2 = DeConv(filters=16, kernel=3, stride=1, padding='VALID', sn=False)
+        self.batch = ClassConditionalBatchNorm(z)
         self.flat = keras.layers.Flatten()
-        self.final = Linear(1)
+        self.final = Linear(units=1)
 
     def call(self, x):
+        x = self.batch(x)
         x = self.l1(x)
         x = tf.nn.relu(x)
         x = self.l2(x)
@@ -277,28 +343,32 @@ class DummyModel(keras.Model):
 
 
 if __name__ == '__main__':
-    new_weights = tf.ones((2000, 16, 16, 64))
-    dummy_out = tf.ones((2000, 1))
+    new_weights = tf.ones((3, 256, 256, 3), dtype=tf.float32)
+    dummy_out = tf.random.normal((3, 1))
 
-    input_data = keras.Input(shape=(3, 3, 1))
-    print("The shape of input is: {}".format(input_data.get_shape()))
-
-    model = DummyModel()
-    logdir = "../logs/graph/"
+    z = tf.split(new_weights, num_or_size_splits=[256//8] * 8, axis=1)
+    x_init = tf.keras.layers.Flatten()(z[0])
+    x = Linear(units=4*4*16*3)(x_init)
+    x = tf.reshape(x, shape=[-1, 4, 4, 48])
+    model = DummyModel(z[0])
+    # out = model(x)
+    # print(out)
+    # print(model.summary())
+    logdir = "logs/graph/"
     if not os.path.exists(logdir):
         os.makedirs(logdir)
 
     tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir)
-    model.build(input_shape=new_weights.get_shape())
+    # model.build(input_shape=z[0].get_shape())
     model.compile(
         optimizer='adam',
         loss='binary_crossentropy',
         metrics=['accuracy']
     )
     model.fit(
-        new_weights,
+        x,
         dummy_out,
-        batch_size=1000,
+        batch_size=1,
         epochs=1,
         callbacks=[tensorboard_callback]
     )
