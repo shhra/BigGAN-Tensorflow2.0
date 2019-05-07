@@ -65,52 +65,59 @@ def l2_norm(x, eps=1e-12):
     return x / (tf.sqrt(tf.reduce_sum(tf.square(x))) + eps)
 
 
-def batch_norm(x, momentum=0.9, eps=1e-3, center=True, scaling=True, is_train=True, name="bn"):
+def batch_norm(momentum=0.9, eps=1e-3, center=True, scaling=True, is_train=True, name="bn"):
     return tf.keras.layers.BatchNormalization(
         momentum=momentum,
         epsilon=eps,
         center=center,
         scale=scaling,
         trainable=is_train,
-        name=name)(x)
+        name=name)
 
 
 def pixel_norm(x, eps=1e-3):
     return x / tf.sqrt(tf.reduce_mean(tf.square(x), axis=[1, 2, 3]) + eps)
 
 
-def spectral_norm(w, gain=1., iteration=1):
-    w_shape = w.get_shape()
-    w = tf.reshape(w, [-1, w_shape[-1]])
-    initializer = tf.initializers.TruncatedNormal(stddev=gain)
-    u = tf.Variable(initializer(shape=(1, w.get_shape()[-1])),
-                    name='u',
-                    trainable=False,
-                    dtype='float32')
-    u_hat = u
-    v_hat = None
-    for i in range(iteration):
-        v_ = tf.matmul(u_hat, tf.transpose(w))
-        v_hat = tf.nn.l2_normalize(v_)
+class SpectralNorm(tf.keras.layers.Layer):
+    def __init__(self, gain=1., iteration=1, **kwargs):
+        super(SpectralNorm, self).__init__(**kwargs, dynamic=True)
+        self.gain = gain
+        self.iteration = iteration
+        self.u = None
 
-        u_ = tf.matmul(v_hat, w)
-        u_hat = tf.nn.l2_normalize(u_)
+    def build(self, input_shape):
+        self.u = self.add_variable(shape=[1, input_shape[-1]],
+                                   initializer=tf.initializers.TruncatedNormal(stddev=self.gain),
+                                   trainable=False)
+        super(SpectralNorm, self).build(input_shape)
 
-    u_hat = tf.stop_gradient(u_hat)
-    v_hat = tf.stop_gradient(v_hat)
+    def call(self, w_in):
+        u_hat = self.u
+        w = tf.reshape(w_in, [-1, w_in.get_shape()[-1]])
+        for i in range(self.iteration):
+            v_ = tf.matmul(u_hat, tf.transpose(w))
+            v_hat = tf.nn.l2_normalize(v_)
 
-    sigma = tf.matmul(tf.matmul(v_hat, w), tf.transpose(u_hat))
+            u_ = tf.matmul(v_hat, w)
+            u_hat = tf.nn.l2_normalize(u_)
 
-    with tf.control_dependencies([u.assign(u_hat)]):
-        w_norm = w / sigma
-        w_norm = tf.reshape(w_norm, w_shape)
+        u_hat = tf.stop_gradient(u_hat)
+        v_hat = tf.stop_gradient(v_hat)
 
-    return w_norm
+        sigma = tf.matmul(tf.matmul(v_hat, w), tf.transpose(u_hat))
+        with tf.control_dependencies([self.u.assign(u_hat)]):
+            w_norm = w / sigma
+            w_norm = tf.reshape(w_norm, w_in.get_shape())
+        return w_norm
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
 
 
 if __name__ == '__main__':
     print("working on resblocks")
     weights = tf.random.normal((1, 3, 3, 1))
     print("Before normalization:\n{}".format(weights))
-    normalized = batch_norm(weights)
+    normalized = SpectralNorm()(weights)
     print("After normalization:\n {}".format(normalized))

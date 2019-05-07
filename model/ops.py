@@ -14,6 +14,7 @@ weight_regularizer_fully = orthogonal_regularizer_fully(0.0001)
 def Resize2DBilinear(size):
     return keras.Lambda(lambda x: tf.image.resize(x, size, method=tf.image.ResizeMethod.BILINEAR, align_corners=True))
 
+
 def Resize2DNearest(size):
     return keras.Lambda(lambda x: tf.image.resize(x, size, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR, align_corners=True))
 
@@ -25,12 +26,31 @@ def Resize2DNearest(size):
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 # Sampling
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+def global_avg_pooling(x):
+    gap = tf.reduce_mean(x, axis=[1, 2])
+
+    return gap
+
+
+def global_sum_pooling(x):
+    gsp = tf.reduce_sum(x, axis=[1, 2])
+
+    return gsp
+
+
+def max_pooling():
+    return keras.layers.MaxPooling2D(pool_size=2, strides=2, padding='SAME')
+
+
+def up_sample(x, scale_factor=2):
+    _, h, w, _ = x.get_shape().as_list()
+    new_size = [h * scale_factor, w * scale_factor]
+    return tf.image.resize(x, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR, size=new_size)
 
 
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 # Layers
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
 class Conv(keras.layers.Layer):
     def __init__(self,
                  filters,
@@ -48,6 +68,8 @@ class Conv(keras.layers.Layer):
         self.pad = pad
         self.pad_type = pad_type
         self.sn = sn
+        if self.sn:
+            self.spectral_norm = SpectralNorm()
         self.use_bias = use_bias
         self.conv2d = None
 
@@ -98,7 +120,7 @@ class Conv(keras.layers.Layer):
 
         if self.sn:
             inputs = tf.nn.conv2d(inputs,
-                                  filters=spectral_norm(self.w),
+                                  filters=self.spectral_norm(self.w),
                                   strides=[1, self.stride, self.stride, 1],
                                   padding='VALID')
             if self.use_bias:
@@ -125,7 +147,11 @@ class DeConv(keras.layers.Layer):
         self.stride = stride
         self.padding = padding
         self.sn = sn
+        if self.sn:
+            self.spectral_norm = SpectralNorm()
         self.use_bias = use_bias
+        self.w = None
+        self.bias = None
         self.deconv = None
 
     def build(self, input_shape):
@@ -155,7 +181,7 @@ class DeConv(keras.layers.Layer):
         super(DeConv, self).build(input_shape)
 
     def call(self, inputs):
-        input_shape = inputs.get_shape()
+        input_shape = tf.shape(inputs)
         if self.padding == 'SAME':
             output_shape = [input_shape[0],
                             input_shape[1] * self.stride,
@@ -168,7 +194,7 @@ class DeConv(keras.layers.Layer):
                             self.filters]
         if self.sn:
             inputs = tf.nn.conv2d_transpose(inputs,
-                                            filters=spectral_norm(self.w),
+                                            filters=self.spectral_norm(self.w),
                                             output_shape=output_shape,
                                             strides=[1, self.stride, self.stride, 1],
                                             padding=self.padding)
@@ -187,6 +213,8 @@ class Linear(keras.layers.Layer):
         super(Linear, self).__init__(**kwargs)
         self.units = units
         self.sn = sn
+        if self.sn:
+            self.sn = SpectralNorm()
         self.use_bias = use_bias
         self.dense = None
 
@@ -212,7 +240,7 @@ class Linear(keras.layers.Layer):
 
     def call(self, inputs):
         if self.sn:
-            inputs = tf.matmul(inputs, spectral_norm(self.w))
+            inputs = tf.matmul(inputs, self.spectral_norm(self.w))
             if self.use_bias:
                 inputs = inputs + self.bias
         else:
@@ -222,7 +250,9 @@ class Linear(keras.layers.Layer):
 
 
 def hw_flatten(x):
-    return tf.reshape(x, shape=[x.get_shape()[0], -1, x.get_shape()[-1]])
+    return tf.reshape(x, shape=tf.convert_to_tensor([x.get_shape()[0],
+                                x.get_shape()[1] * x.get_shape()[2],
+                                x.get_shape()[3]]))
 
 
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -284,62 +314,133 @@ class ClassConditionalBatchNorm(tf.keras.layers.Layer):
         return input_shape
 
 
-
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 # Model blocks
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-
 class ResBlock(keras.Model):
     """
     Create a ResNet block for up sampling
     """
-    def __init__(self, channel):
+    def __init__(self, z, channel, use_bias=True, sn=True):
         super(ResBlock, self).__init__(name='')
         self.channel = channel
+        self.use_bias = use_bias
+        self.sn = sn
+        self.z = z
+        self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn)
+        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn)
+        # self.conv3 = Conv(filters=self.channel, kernel=1, stride=2, pad=1, sn=self.sn)
+        self.ccbn = ClassConditionalBatchNorm(self.z)
 
-    def call(self, input, is_training, sn):
-        pass
+    def call(self, inputs, is_training=True):
+        x = self.conv1(inputs)
+        x = self.ccbn(x)
+        x = tf.nn.relu(x)
+
+        x = self.conv2(x)
+        x = self.ccbn(x)
+
+        return x + inputs
+
 
 class ResBlockUp(keras.Model):
     """
     Create a ResNet block for up sampling
     """
-    def __init__(self, inputs, channel):
+    def __init__(self, z, channel, use_bias=True, sn=True):
         super(ResBlockUp, self).__init__(name='')
-        pass
+        self.channel = channel
+        self.use_bias = use_bias
+        self.sn = sn
+        self.z = z
+        self.deconv1 = DeConv(filters=self.channel, kernel=3, stride=2, sn=self.sn, use_bias=self.use_bias)
+        self.deconv2 = DeConv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias)
+        self.deconv3 = DeConv(filters=self.channel, kernel=1, stride=2, sn=self.sn, use_bias=self.use_bias, padding='VALID')
+        self.ccbn = ClassConditionalBatchNorm(z=self.z)
+
+    def call(self, inputs, is_training=True):
+        x = self.ccbn(inputs)
+        x = tf.nn.relu(x)
+        x = self.deconv1(x)
+
+        x = self.ccbn(x)
+        x = tf.nn.relu(x)
+        x = self.deconv2(x)
+
+        x_init = self.deconv3(inputs)
+
+        return x + x_init
 
 
 class ResBlockDown(keras.Model):
     """
     Create a ResNet block for down sampling
     """
-    def __init__(self, inputs, channels, kernel):
+    def __init__(self, z, channel, use_bias=True, sn=True):
         super(ResBlockDown, self).__init__(name='')
-        pass
-
-
-class DummyModel(keras.Model):
-    def __init__(self, z, **kwargs):
-        super(DummyModel, self).__init__(**kwargs)
+        self.channel = channel
+        self.use_bias = use_bias
+        self.sn = sn
         self.z = z
-        self.l1 = Conv(filters=16, kernel=3, stride=1, pad=0, sn=False)
-        self.l2 = DeConv(filters=16, kernel=3, stride=1, padding='VALID', sn=False)
-        self.batch = ClassConditionalBatchNorm(z)
-        self.flat = keras.layers.Flatten()
-        self.final = Linear(units=1)
+        self.conv1 = Conv(filters=self.channel, kernel=3, stride=2, sn=self.sn, use_bias=self.use_bias, pad=1)
+        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1)
+        self.conv3 = Conv(filters=self.channel, kernel=1, stride=2, sn=self.sn, use_bias=self.use_bias, pad=0)
+        self.bn = batch_norm()
 
-    def call(self, x):
-        x = self.batch(x)
-        x = self.l1(x)
+    def call(self, inputs, is_training=True):
+        x = self.bn(inputs)
         x = tf.nn.relu(x)
-        x = self.l2(x)
-        x = tf.nn.relu(x)
-        x = self.flat(x)
-        x = tf.nn.relu(x)
-        x = self.final(x)
+        x = self.conv1(x)
+        print(x.get_shape())
 
-        return x
+        x = self.bn(x)
+        x = tf.nn.relu(x)
+        x = self.conv2(x)
+        print(x.get_shape())
+
+        x_init = self.conv3(inputs)
+        print(x.get_shape())
+
+        return x + x_init
+
+
+class SelfAttention(keras.Model):
+    def __init__(self, channels, sn=True):
+        super(SelfAttention, self).__init__()
+        self.channels = channels
+        self.sn = sn
+        self.f = Conv(filters=channels//8, kernel=1, stride=1, sn=sn)
+        self.g = Conv(filters=channels//8, kernel=1, stride=1, sn=sn)
+        self.h = Conv(filters=channels//2, kernel=1, stride=1, sn=sn)
+        self.o = Conv(filters=channels, kernel=1, stride=1, sn=sn)
+        self.mp = max_pooling()
+
+    def call(self, inputs):
+        f = self.f(inputs)
+        f = self.mp(f)
+
+        g = self.g(inputs)
+
+        h = self.h(inputs)
+        g = self.mp(h)
+
+        print(g.get_shape())
+        g_ = hw_flatten(g)
+        print(g_.get_shape())
+        s = tf.matmul(hw_flatten(g), hw_flatten(f), transpose_b=True)
+
+        beta = tf.nn.softmax(s)
+        shape = tf.shape(inputs)
+
+        o = tf.matmul(beta, hw_flatten(h))
+        o = tf.reshape(o, shape=[shape[0], shape[1], shape[2], self.channels // 2])
+        o = self.o(o)
+        zeros = keras.initializers.Constant(0.0)
+        gamma = tf.Variable(lambda: zeros(shape=[1]))
+        x = gamma * o + inputs
+        # inputs = o + inputs
+
+        return inputs
 
 
 if __name__ == '__main__':
@@ -348,23 +449,24 @@ if __name__ == '__main__':
 
     z = tf.split(new_weights, num_or_size_splits=[256//8] * 8, axis=1)
     x_init = tf.keras.layers.Flatten()(z[0])
-    x = Linear(units=4*4*16*3)(x_init)
-    x = tf.reshape(x, shape=[-1, 4, 4, 48])
-    model = DummyModel(z[0])
+    x = Linear(units=16*16*16*1)(x_init)
+    x = tf.reshape(x, shape=[-1, 16, 16, 16])
+    model = SelfAttention(channels=16, sn=False)
     # out = model(x)
     # print(out)
     # print(model.summary())
-    logdir = "logs/graph/"
+    logdir = "../logs/graph/"
+    tf.summary.trace_on(graph=True, profiler=True)
     if not os.path.exists(logdir):
         os.makedirs(logdir)
 
-    tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir)
-    # model.build(input_shape=z[0].get_shape())
+    tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir, write_graph=False)
     model.compile(
         optimizer='adam',
         loss='binary_crossentropy',
         metrics=['accuracy']
     )
+    print("the input before fit: ", x.get_shape())
     model.fit(
         x,
         dummy_out,
@@ -372,6 +474,4 @@ if __name__ == '__main__':
         epochs=1,
         callbacks=[tensorboard_callback]
     )
-    model.summary()
-
 
