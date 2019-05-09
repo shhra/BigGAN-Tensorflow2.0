@@ -1,6 +1,7 @@
 """ Necessary functions to build the model"""
 import tensorflow as tf
 import tensorflow.keras as keras
+from tensorflow.python.keras.utils import conv_utils
 import os
 from model.utils import *
 
@@ -18,9 +19,53 @@ def Resize2DBilinear(size):
 def Resize2DNearest(size):
     return keras.Lambda(lambda x: tf.image.resize(x, size, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR, align_corners=True))
 
+
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 # Loss
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+def discriminator_loss(loss_func, real, fake):
+    real_loss = 0
+    fake_loss = 0
+
+    if loss_func.__contains__('wgan'):
+        real_loss = -tf.reduce_mean(real)
+        fake_loss = tf.reduce_mean(fake)
+
+    if loss_func == 'lsgan':
+        real_loss = tf.reduce_mean(tf.math.squared_difference(real, 1.0))
+        fake_loss = tf.reduce_mean(tf.square(fake))
+
+    if loss_func == 'gan' or loss_func == 'dragan':
+        real_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(real), logits=real))
+        fake_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.zeros_like(fake), logits=fake))
+
+    if loss_func == 'hinge':
+        real_loss = tf.reduce_mean(tf.nn.relu(1.0 - real))
+        fake_loss = tf.reduce_mean(tf.nn.relu(1.0 + fake))
+
+    loss = real_loss + fake_loss
+
+    return loss
+
+
+def generator_loss(loss_func, fake):
+    fake_loss = 0
+
+    if loss_func.__contains__('wgan'):
+        fake_loss = -tf.reduce_mean(fake)
+
+    if loss_func == 'lsgan':
+        fake_loss = tf.reduce_mean(tf.math.squared_difference(fake, 1.0))
+
+    if loss_func == 'gan' or loss_func == 'dragan':
+        fake_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(fake), logits=fake))
+
+    if loss_func == 'hinge':
+        fake_loss = -tf.reduce_mean(fake)
+
+    loss = fake_loss
+
+    return loss
 
 
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -61,17 +106,23 @@ class Conv(keras.layers.Layer):
                  sn=False,
                  use_bias=True,
                  **kwargs):
-        super(Conv, self).__init__(**kwargs)
+        super(Conv, self).__init__(**kwargs, dynamic=True)
         self.filters = filters
         self.kernel = kernel
         self.stride = stride
         self.pad = pad
+        if pad == 0:
+            self.padding = 'valid'
+        else:
+            self.padding = 'same'
         self.pad_type = pad_type
         self.sn = sn
         if self.sn:
             self.spectral_norm = SpectralNorm()
         self.use_bias = use_bias
         self.conv2d = None
+        self.w = None
+        self.bias = None
 
     def build(self, input_shape):
         if self.sn:
@@ -80,6 +131,7 @@ class Conv(keras.layers.Layer):
                 initializer=weight_init,
                 regularizer=weight_regularizer,
                 name='kernel',
+                dtype='float32'
             )
 
             if self.use_bias:
@@ -130,6 +182,19 @@ class Conv(keras.layers.Layer):
             inputs = self.conv2d(inputs)
 
         return inputs
+
+    def compute_output_shape(self, input_shape):
+        input_shape = tf.TensorShape(input_shape).as_list()
+        space = input_shape[1:-1]
+        new_space = []
+        for i in range(len(space)):
+            new_dim = conv_utils.conv_output_length(
+                space[i],
+                self.kernel,
+                padding=self.padding,
+                stride=self.stride)
+            new_space.append(new_dim)
+        return tf.TensorShape([input_shape[0]] + new_space + [self.filters])
 
 
 class DeConv(keras.layers.Layer):
@@ -182,6 +247,7 @@ class DeConv(keras.layers.Layer):
 
     def call(self, inputs):
         input_shape = tf.shape(inputs)
+        # print("The input shape from {} is {}".format(self.name, inputs.shape))
         if self.padding == 'SAME':
             output_shape = [input_shape[0],
                             input_shape[1] * self.stride,
@@ -192,6 +258,7 @@ class DeConv(keras.layers.Layer):
                             input_shape[1] * self.stride + max(self.kernel - self.stride, 0),
                             input_shape[2] * self.stride + max(self.kernel - self.stride, 0),
                             self.filters]
+        # print("The output shape from {} is {}".format(self.name, output_shape))
         if self.sn:
             inputs = tf.nn.conv2d_transpose(inputs,
                                             filters=self.spectral_norm(self.w),
@@ -214,7 +281,7 @@ class Linear(keras.layers.Layer):
         self.units = units
         self.sn = sn
         if self.sn:
-            self.sn = SpectralNorm()
+            self.spectral_norm = SpectralNorm()
         self.use_bias = use_bias
         self.dense = None
 
@@ -223,7 +290,6 @@ class Linear(keras.layers.Layer):
         if self.sn:
             self.w = self.add_variable(name="kernel",
                                        shape=[filters, self.units],
-                                       dtype='tf.float32',
                                        initializer=weight_init,
                                        regularizer=weight_regularizer)
             if self.use_bias:
@@ -248,11 +314,8 @@ class Linear(keras.layers.Layer):
 
         return inputs
 
-
-def hw_flatten(x):
-    return tf.reshape(x, shape=tf.convert_to_tensor([x.get_shape()[0],
-                                x.get_shape()[1] * x.get_shape()[2],
-                                x.get_shape()[3]]))
+    def compute_output_shape(self, input_shape):
+        return tf.TensorShape([self.units])
 
 
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -289,7 +352,7 @@ class ClassConditionalBatchNorm(tf.keras.layers.Layer):
         super(ClassConditionalBatchNorm, self).build(input_shape)
 
     def call(self, x, is_training=True):
-        _, _, _, c = x.get_shape().as_list()
+        c = tf.shape(x)[-1]
         decay = 0.9
         eps = 1e-05
 
@@ -321,67 +384,73 @@ class ResBlock(keras.Model):
     """
     Create a ResNet block for up sampling
     """
-    def __init__(self, z, channel, use_bias=True, sn=True):
+    def __init__(self, channels, use_bias=True, sn=True):
         super(ResBlock, self).__init__(name='')
-        self.channel = channel
+        self.channel = channels
         self.use_bias = use_bias
         self.sn = sn
-        self.z = z
         self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn)
         self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn)
-        # self.conv3 = Conv(filters=self.channel, kernel=1, stride=2, pad=1, sn=self.sn)
-        self.ccbn = ClassConditionalBatchNorm(self.z)
+        self.bn = batch_norm()
 
     def call(self, inputs, is_training=True):
         x = self.conv1(inputs)
-        x = self.ccbn(x)
+        x = self.bn(x)
         x = tf.nn.relu(x)
 
         x = self.conv2(x)
-        x = self.ccbn(x)
+        x = self.bn(x)
 
         return x + inputs
+
+    def compute_output_shape(self, input_shape):
+        return self.conv2.compute_output_shape(input_shape)
 
 
 class ResBlockUp(keras.Model):
     """
     Create a ResNet block for up sampling
     """
-    def __init__(self, z, channel, use_bias=True, sn=True):
+    def __init__(self, z, channels, use_bias=True, sn=False):
         super(ResBlockUp, self).__init__(name='')
-        self.channel = channel
+        self.channel = channels
         self.use_bias = use_bias
         self.sn = sn
         self.z = z
-        self.deconv1 = DeConv(filters=self.channel, kernel=3, stride=2, sn=self.sn, use_bias=self.use_bias)
-        self.deconv2 = DeConv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias)
-        self.deconv3 = DeConv(filters=self.channel, kernel=1, stride=2, sn=self.sn, use_bias=self.use_bias, padding='VALID')
-        self.ccbn = ClassConditionalBatchNorm(z=self.z)
+        self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1)
+        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1)
+        self.conv3 = Conv(filters=self.channel, kernel=1, stride=1, sn=self.sn, use_bias=self.use_bias)
+        self.ccbn1 = ClassConditionalBatchNorm(z=self.z)
+        self.ccbn2 = ClassConditionalBatchNorm(z=self.z)
+        self.relu = keras.layers.ReLU()
+        self.final_shape = None
 
     def call(self, inputs, is_training=True):
-        x = self.ccbn(inputs)
-        x = tf.nn.relu(x)
-        x = self.deconv1(x)
-
-        x = self.ccbn(x)
-        x = tf.nn.relu(x)
-        x = self.deconv2(x)
-
-        x_init = self.deconv3(inputs)
+        x = self.ccbn1(inputs)
+        x = self.relu(x)
+        x = up_sample(x)
+        x_init = up_sample(inputs)
+        x = self.conv1(x)
+        x = self.ccbn2(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x_init = self.conv3(x_init)
 
         return x + x_init
+
+    def compute_output_shape(self, input_shape):
+        return self.conv3.compute_output_shape(input_shape)
 
 
 class ResBlockDown(keras.Model):
     """
     Create a ResNet block for down sampling
     """
-    def __init__(self, z, channel, use_bias=True, sn=True):
+    def __init__(self, channels, use_bias=True, sn=True):
         super(ResBlockDown, self).__init__(name='')
-        self.channel = channel
+        self.channel = channels
         self.use_bias = use_bias
         self.sn = sn
-        self.z = z
         self.conv1 = Conv(filters=self.channel, kernel=3, stride=2, sn=self.sn, use_bias=self.use_bias, pad=1)
         self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1)
         self.conv3 = Conv(filters=self.channel, kernel=1, stride=2, sn=self.sn, use_bias=self.use_bias, pad=0)
@@ -391,56 +460,50 @@ class ResBlockDown(keras.Model):
         x = self.bn(inputs)
         x = tf.nn.relu(x)
         x = self.conv1(x)
-        print(x.get_shape())
 
         x = self.bn(x)
         x = tf.nn.relu(x)
         x = self.conv2(x)
-        print(x.get_shape())
 
         x_init = self.conv3(inputs)
-        print(x.get_shape())
 
         return x + x_init
 
+    def compute_output_shape(self, input_shape):
+        return self.conv3.compute_output_shape(input_shape)
+
 
 class SelfAttention(keras.Model):
-    def __init__(self, channels, sn=True):
+    def __init__(self, channels, sn=False):
         super(SelfAttention, self).__init__()
         self.channels = channels
         self.sn = sn
-        self.f = Conv(filters=channels//8, kernel=1, stride=1, sn=sn)
-        self.g = Conv(filters=channels//8, kernel=1, stride=1, sn=sn)
-        self.h = Conv(filters=channels//2, kernel=1, stride=1, sn=sn)
-        self.o = Conv(filters=channels, kernel=1, stride=1, sn=sn)
-        self.mp = max_pooling()
+        self.f = Conv(filters=channels//8, kernel=1, stride=1, pad=0, sn=sn)
+        self.g = Conv(filters=channels//8, kernel=1, stride=1, pad=0, sn=sn)
+        self.h = Conv(filters=channels, kernel=1, stride=1, pad=0, sn=sn)
+        self.o = Conv(filters=channels, kernel=1, stride=1, pad=0, sn=sn)
+        zeros = keras.initializers.Constant(0.0)
+        self.gamma = tf.Variable(lambda: zeros(shape=[1]))
 
     def call(self, inputs):
-        f = self.f(inputs)
-        f = self.mp(f)
-
-        g = self.g(inputs)
-
-        h = self.h(inputs)
-        g = self.mp(h)
-
-        print(g.get_shape())
-        g_ = hw_flatten(g)
-        print(g_.get_shape())
-        s = tf.matmul(hw_flatten(g), hw_flatten(f), transpose_b=True)
-
-        beta = tf.nn.softmax(s)
+        @tf.function
+        def hw_flatten(x):
+            return tf.reshape(x, shape=[tf.shape(x)[0], tf.shape(x)[1]*tf.shape(x)[2], tf.shape(x)[3]])
         shape = tf.shape(inputs)
-
+        f = self.f(inputs)
+        g = self.g(inputs)
+        h = self.h(inputs)
+        s = tf.matmul(hw_flatten(g), hw_flatten(f), transpose_b=True)
+        beta = tf.nn.softmax(s)
         o = tf.matmul(beta, hw_flatten(h))
-        o = tf.reshape(o, shape=[shape[0], shape[1], shape[2], self.channels // 2])
+        o = tf.reshape(o, shape=shape)
         o = self.o(o)
-        zeros = keras.initializers.Constant(0.0)
-        gamma = tf.Variable(lambda: zeros(shape=[1]))
-        x = gamma * o + inputs
-        # inputs = o + inputs
+        x = self.gamma * o + inputs
 
-        return inputs
+        return x
+
+    def compute_output_shape(self, input_shape):
+        return self.o.compute_output_shape(input_shape)
 
 
 if __name__ == '__main__':
@@ -452,26 +515,26 @@ if __name__ == '__main__':
     x = Linear(units=16*16*16*1)(x_init)
     x = tf.reshape(x, shape=[-1, 16, 16, 16])
     model = SelfAttention(channels=16, sn=False)
+    model.build(input_shape=(3, 16, 16, 16))
     # out = model(x)
     # print(out)
-    # print(model.summary())
-    logdir = "../logs/graph/"
-    tf.summary.trace_on(graph=True, profiler=True)
-    if not os.path.exists(logdir):
-        os.makedirs(logdir)
-
-    tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir, write_graph=False)
-    model.compile(
-        optimizer='adam',
-        loss='binary_crossentropy',
-        metrics=['accuracy']
-    )
-    print("the input before fit: ", x.get_shape())
-    model.fit(
-        x,
-        dummy_out,
-        batch_size=1,
-        epochs=1,
-        callbacks=[tensorboard_callback]
-    )
+    print(model.summary())
+    # logdir = "../logs/graph/"
+    # if not os.path.exists(logdir):
+    #     os.makedirs(logdir)
+    #
+    # tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir, write_graph=False)
+    # model.compile(
+    #     optimizer='adam',
+    #     loss='binary_crossentropy',
+    #     metrics=['accuracy']
+    # )
+    # print("the input before fit: ", x.get_shape())
+    # model.fit(
+    #     x,
+    #     dummy_out,
+    #     batch_size=1,
+    #     epochs=1,
+    #     callbacks=[tensorboard_callback]
+    # )
 

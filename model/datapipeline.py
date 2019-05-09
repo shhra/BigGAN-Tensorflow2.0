@@ -147,7 +147,7 @@ if __name__ == '__main__':
     # clean_images('../../Data/dog_cat')
     input_pipeline = InputHandler(root_path='../../Data/dog_cat')
     ds = input_pipeline.build_ds()
-    ds = ds.batch(32).prefetch(AUTOTUNE)
+    ds = ds.batch(1).prefetch(AUTOTUNE)
     print(ds)
 
 

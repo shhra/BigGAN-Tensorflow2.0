@@ -93,8 +93,9 @@ class SpectralNorm(tf.keras.layers.Layer):
         super(SpectralNorm, self).build(input_shape)
 
     def call(self, w_in):
+        shape = tf.shape(w_in)
+        w = tf.reshape(w_in, shape=[-1, shape[-1]])
         u_hat = self.u
-        w = tf.reshape(w_in, [-1, w_in.get_shape()[-1]])
         for i in range(self.iteration):
             v_ = tf.matmul(u_hat, tf.transpose(w))
             v_hat = tf.nn.l2_normalize(v_)
