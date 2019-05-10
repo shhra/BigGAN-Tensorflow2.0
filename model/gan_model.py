@@ -63,54 +63,42 @@ class GeneratorBlock(tf.keras.Model):
 
 
 class DiscriminatorBlock(tf.keras.Model):
-    def __init__(self, ch, use_bias, sn):
+    def __init__(self, ch, use_bias, sn, is_training=True):
         super(DiscriminatorBlock, self).__init__()
         self.ch = ch
         self.use_bias = use_bias
         self.sn = sn
-        self.res_down_1ch_to_2ch = ResBlockDown(channels=self.ch, use_bias=self.use_bias, sn=self.sn)
-        self.res_down_2ch_to_4ch = ResBlockDown(channels=self.ch*2, use_bias=self.use_bias, sn=self.sn)
-        self.non_local = SelfAttention(channels=ch*2, sn=self.sn)
-        self.res_down_4ch_to_8ch = ResBlockDown(channels=self.ch*4, use_bias=self.use_bias, sn=self.sn)
-        self.res_down_8ch_to_8ch = ResBlockDown(channels=self.ch*4, use_bias=self.use_bias, sn=self.sn)
-        self.res_down_8ch_to_16ch = ResBlockDown(channels=self.ch*8, use_bias=self.use_bias, sn=self.sn)
-        self.res_down_16ch_to_16ch = ResBlockDown(channels=self.ch*8, use_bias=self.use_bias, sn=self.sn)
+        self.is_training = is_training
+        self.res_down_1ch_to_2ch = ResBlockDown(channels=self.ch, use_bias=self.use_bias, sn=self.sn, is_training=self.is_training)
+        self.res_down_2ch_to_4ch = ResBlockDown(channels=self.ch*2, use_bias=self.use_bias, sn=self.sn, is_training=self.is_training)
+        self.non_local = SelfAttention(channels=ch*2, sn=self.sn, is_training=self.is_training)
+        self.res_down_4ch_to_8ch = ResBlockDown(channels=self.ch*4, use_bias=self.use_bias, sn=self.sn, is_training=self.is_training)
+        self.res_down_8ch_to_8ch = ResBlockDown(channels=self.ch*4, use_bias=self.use_bias, sn=self.sn, is_training=self.is_training)
+        self.res_down_8ch_to_16ch = ResBlockDown(channels=self.ch*8, use_bias=self.use_bias, sn=self.sn, is_training=self.is_training)
+        self.res_down_16ch_to_16ch = ResBlockDown(channels=self.ch*8, use_bias=self.use_bias, sn=self.sn, is_training=self.is_training)
         self.res_16ch_to_16ch = ResBlock(channels=self.ch*8, use_bias=self.use_bias, sn=self.sn)
         self.relu = tf.keras.layers.ReLU()
         self.gsp = global_sum_pooling
         # Insert Embedding here << << <<
         self.linear = Linear(units=1, sn=self.sn)
-        self.final_shape = None
 
     def call(self, inputs, is_training=True):
-        print("The output shape of x0 is ", inputs.shape)
         x = self.res_down_1ch_to_2ch(inputs)
-        print("The output shape of x1 is ", x.shape)
         x = self.res_down_2ch_to_4ch(x)
-        print("The output shape of x2 is ", x.shape)
         x = self.non_local(x)
-        print("The output shape of x3 is ", x.shape)
         x = self.res_down_4ch_to_8ch(x)
-        print("The output shape of x4 is ", x.shape)
         x = self.res_down_8ch_to_8ch(x)
-        print("The output shape of x5 is ", x.shape)
         x = self.res_down_8ch_to_16ch(x)
-        print("The output shape of x6 is ", x.shape)
         x = self.res_down_16ch_to_16ch(x)
-        print("The output shape of x7 is ", x.shape)
         x = self.res_16ch_to_16ch(x)
-        print("The output shape of x8 is ", x.shape)
         x = self.relu(x)
-        print("The output shape of x9 is ", x.shape)
         x = self.gsp(x)
-        print("The output shape of x10 is ", x.shape)
         x = self.linear(x)
-        self.final_shape = x.get_shape().as_list()
 
         return x
 
     def compute_output_shape(self, input_shape):
-        return self.final_shape
+        return self.linear.compute_output_shape(input_shape)
 
 
 class BigGAN256:

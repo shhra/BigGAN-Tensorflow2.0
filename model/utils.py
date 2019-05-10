@@ -11,7 +11,8 @@ def orthogonal_regularizer(scale):
 
     def ortho_reg(w):
         """ Reshaping the matrix in to 2D tensor for enforcing orthogonality"""
-        _, _, _, c = w.get_shape().as_list()
+        shape = w.get_shape().as_list()
+        c = shape[-1]
 
         w = tf.reshape(w, [-1, c])
 

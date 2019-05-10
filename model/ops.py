@@ -87,6 +87,10 @@ def max_pooling():
     return keras.layers.MaxPooling2D(pool_size=2, strides=2, padding='SAME')
 
 
+def avg_pooling():
+    return keras.layers.AveragePooling2D(pool_size=2, strides=2, padding='SAME')
+
+
 def up_sample(x, scale_factor=2):
     _, h, w, _ = x.get_shape().as_list()
     new_size = [h * scale_factor, w * scale_factor]
@@ -105,6 +109,7 @@ class Conv(keras.layers.Layer):
                  pad_type='zero',
                  sn=False,
                  use_bias=True,
+                 is_training=True,
                  **kwargs):
         super(Conv, self).__init__(**kwargs, dynamic=True)
         self.filters = filters
@@ -121,8 +126,9 @@ class Conv(keras.layers.Layer):
             self.spectral_norm = SpectralNorm()
         self.use_bias = use_bias
         self.conv2d = None
-        self.w = None
-        self.bias = None
+        self.is_training = is_training
+        # self.w = None
+        # self.bias = None
 
     def build(self, input_shape):
         if self.sn:
@@ -131,13 +137,14 @@ class Conv(keras.layers.Layer):
                 initializer=weight_init,
                 regularizer=weight_regularizer,
                 name='kernel',
-                dtype='float32'
+                trainable=self.is_training
             )
 
             if self.use_bias:
                 self.bias = self.add_variable(name='bias',
                                               shape=[self.filters],
-                                              initializer=keras.initializers.get('zeros'))
+                                              initializer=keras.initializers.get('zeros'),
+                                              trainable=self.is_training)
 
         else:
             self.conv2d = keras.layers.Conv2D(
@@ -146,7 +153,8 @@ class Conv(keras.layers.Layer):
                 kernel_initializer=weight_init,
                 kernel_regularizer=weight_regularizer,
                 strides=self.stride,
-                use_bias=self.use_bias)
+                use_bias=self.use_bias,
+                trainable=self.is_training)
 
         super(Conv, self).build(input_shape)
 
@@ -205,6 +213,7 @@ class DeConv(keras.layers.Layer):
                  padding='SAME',
                  sn=False,
                  use_bias=True,
+                 is_training=True,
                  **kwargs):
         super(DeConv, self).__init__(**kwargs)
         self.filters = filters
@@ -218,6 +227,7 @@ class DeConv(keras.layers.Layer):
         self.w = None
         self.bias = None
         self.deconv = None
+        self.is_training = is_training
 
     def build(self, input_shape):
         if self.sn:
@@ -225,13 +235,15 @@ class DeConv(keras.layers.Layer):
                 shape=[self.kernel, self.kernel, input_shape[-1], self.filters],
                 initializer=weight_init,
                 regularizer=weight_regularizer,
-                name='kernel'
+                name='kernel',
+                trainable=self.is_training
             )
 
             if self.use_bias:
                 self.bias = self.add_variable(name='bias',
                                               shape=[self.filters],
-                                              initializer=keras.initializers.get('zeros'))
+                                              initializer=keras.initializers.get('zeros'),
+                                              trainable=self.is_training)
 
         else:
             self.deconv = keras.layers.Conv2DTranspose(
@@ -276,7 +288,7 @@ class DeConv(keras.layers.Layer):
 
 class Linear(keras.layers.Layer):
 
-    def __init__(self, units, sn=False, use_bias=True, **kwargs):
+    def __init__(self, units, sn=False, use_bias=True, is_training=True, **kwargs):
         super(Linear, self).__init__(**kwargs)
         self.units = units
         self.sn = sn
@@ -284,6 +296,7 @@ class Linear(keras.layers.Layer):
             self.spectral_norm = SpectralNorm()
         self.use_bias = use_bias
         self.dense = None
+        self.is_training = is_training
 
     def build(self, input_shape):
         filters = input_shape[-1]
@@ -291,16 +304,18 @@ class Linear(keras.layers.Layer):
             self.w = self.add_variable(name="kernel",
                                        shape=[filters, self.units],
                                        initializer=weight_init,
-                                       regularizer=weight_regularizer)
+                                       regularizer=weight_regularizer,
+                                       trainable=self.is_training)
             if self.use_bias:
                 self.bias = self.add_variable(name="bias",
                                          shape=[self.units],
-                                         initializer=keras.initializers.get('zeros'))
+                                         initializer=keras.initializers.get('zeros'),
+                                         trainable=self.is_training)
         else:
             self.dense = keras.layers.Dense(units=self.units,
                                           kernel_initializer=weight_init,
                                           kernel_regularizer=weight_regularizer_fully,
-                                          use_bias=self.use_bias)
+                                          use_bias=self.use_bias, trainable=self.is_training)
 
         super(Linear, self).build(input_shape)
 
@@ -389,8 +404,8 @@ class ResBlock(keras.Model):
         self.channel = channels
         self.use_bias = use_bias
         self.sn = sn
-        self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn)
-        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn)
+        self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn, is_training=True)
+        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, pad=1, sn=self.sn, is_training=True)
         self.bn = batch_norm()
 
     def call(self, inputs, is_training=True):
@@ -411,15 +426,16 @@ class ResBlockUp(keras.Model):
     """
     Create a ResNet block for up sampling
     """
-    def __init__(self, z, channels, use_bias=True, sn=False):
+    def __init__(self, z, channels, use_bias=True, sn=False, is_training=True):
         super(ResBlockUp, self).__init__(name='')
         self.channel = channels
+        self.is_training=is_training
         self.use_bias = use_bias
         self.sn = sn
         self.z = z
-        self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1)
-        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1)
-        self.conv3 = Conv(filters=self.channel, kernel=1, stride=1, sn=self.sn, use_bias=self.use_bias)
+        self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1, is_training=self.is_training)
+        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1, is_training=self.is_training)
+        self.conv3 = Conv(filters=self.channel, kernel=1, stride=1, sn=self.sn, use_bias=self.use_bias, is_training=True)
         self.ccbn1 = ClassConditionalBatchNorm(z=self.z)
         self.ccbn2 = ClassConditionalBatchNorm(z=self.z)
         self.relu = keras.layers.ReLU()
@@ -446,42 +462,49 @@ class ResBlockDown(keras.Model):
     """
     Create a ResNet block for down sampling
     """
-    def __init__(self, channels, use_bias=True, sn=True):
+    def __init__(self, channels, use_bias=True, sn=True, is_training=True):
         super(ResBlockDown, self).__init__(name='')
         self.channel = channels
         self.use_bias = use_bias
         self.sn = sn
-        self.conv1 = Conv(filters=self.channel, kernel=3, stride=2, sn=self.sn, use_bias=self.use_bias, pad=1)
-        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1)
-        self.conv3 = Conv(filters=self.channel, kernel=1, stride=2, sn=self.sn, use_bias=self.use_bias, pad=0)
-        self.bn = batch_norm()
+        self.is_training = is_training
+        self.conv1 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1, is_training=self.is_training)
+        self.conv2 = Conv(filters=self.channel, kernel=3, stride=1, sn=self.sn, use_bias=self.use_bias, pad=1, is_training=self.is_training)
+        self.avg1 = avg_pooling()
+        self.avg2 = avg_pooling()
+        self.conv3 = Conv(filters=self.channel, kernel=1, stride=1, sn=self.sn, use_bias=self.use_bias, pad=0, is_training=self.is_training)
+        self.conv4 = Conv(filters=self.channel, kernel=1, stride=2, sn=self.sn, use_bias=self.use_bias, pad=0, is_training=False)
+        self.bn1 = batch_norm()
+        self.bn2 = batch_norm()
+        self.relu = keras.layers.ReLU()
 
-    def call(self, inputs, is_training=True):
-        x = self.bn(inputs)
-        x = tf.nn.relu(x)
+    def call(self, inputs):
+        x = self.relu(inputs)
         x = self.conv1(x)
 
-        x = self.bn(x)
-        x = tf.nn.relu(x)
+        x = self.relu(x)
         x = self.conv2(x)
+        x = self.avg1(x)
 
         x_init = self.conv3(inputs)
+        x_init = self.avg2(x_init)
 
         return x + x_init
 
     def compute_output_shape(self, input_shape):
-        return self.conv3.compute_output_shape(input_shape)
+        return self.conv4.compute_output_shape(input_shape)
 
 
 class SelfAttention(keras.Model):
-    def __init__(self, channels, sn=False):
+    def __init__(self, channels, sn=False, is_training=True):
         super(SelfAttention, self).__init__()
         self.channels = channels
         self.sn = sn
-        self.f = Conv(filters=channels//8, kernel=1, stride=1, pad=0, sn=sn)
-        self.g = Conv(filters=channels//8, kernel=1, stride=1, pad=0, sn=sn)
-        self.h = Conv(filters=channels, kernel=1, stride=1, pad=0, sn=sn)
-        self.o = Conv(filters=channels, kernel=1, stride=1, pad=0, sn=sn)
+        self.is_training = is_training
+        self.f = Conv(filters=channels//8, kernel=1, stride=1, pad=0, sn=sn, is_training=self.is_training)
+        self.g = Conv(filters=channels//8, kernel=1, stride=1, pad=0, sn=sn, is_training=self.is_training)
+        self.h = Conv(filters=channels, kernel=1, stride=1, pad=0, sn=sn, is_training=self.is_training)
+        self.o = Conv(filters=channels, kernel=1, stride=1, pad=0, sn=sn, is_training=self.is_training)
         zeros = keras.initializers.Constant(0.0)
         self.gamma = tf.Variable(lambda: zeros(shape=[1]))
 

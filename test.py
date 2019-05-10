@@ -58,7 +58,7 @@ def main():
     # Take input
     input_pipeline = InputHandler(root_path='../../Data/dog_cat_small')
     ds = input_pipeline.build_ds()
-    ds = ds.batch(2)
+    ds = ds.batch(1)
     image_batch, label_batch = next(iter(ds))
 
     # default gan = BigGAN_128
@@ -68,23 +68,21 @@ def main():
 
     # build graph
     model = DiscriminatorBlock(ch=64, use_bias=True, sn=True)
-
-    model.build(input_shape=(1, 256, 256, 3))
-    # image = tf.initializers.TruncatedNormal()(shape=[1, 256, 256, 3])
-    # model.compile(
-    #     optimizer='adam',
-    #     loss=discriminator_loss,
-    #     metrics=['accuracy']
-    # )
-    # model.fit(
-    #     image,
-    #     tf.convert_to_tensor([1]),
-    #     epochs=1,
-    #     batch_size=1
-    # )
+    model.trainable = False
+    # model = GeneratorBlock(z=z, z_dim=args.z_dim, ch=args.ch, c_dim=3)
+    # model.train_on_batch()
+    model.compile(optimizer='adam',
+        loss='categorical_crossentropy',
+        metrics=['accuracy'],
+    )
+    model.fit(
+        image_batch,
+        label_batch,
+        epochs=1
+    )
     model.summary()
 
-    if args.phase == 'train' :
+    if args.phase == 'train':
         # launch the graph in a session
         # gan.train()
 
